@@ -422,23 +422,66 @@ func createOrRestartPod(podClient coreclientset.PodInterface, pod *coreapi.Pod) 
 }
 
 func waitForPodDeletion(podClient coreclientset.PodInterface, name string, uid types.UID) error {
-	timeout := 300
-	for i := 0; i < timeout; i += 2 {
-		pod, err := podClient.Get(name, meta.GetOptions{})
-		if errors.IsNotFound(err) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("could not retrieve deleting pod: %v", err)
-		}
-		if pod.UID != uid {
-			return nil
-		}
-		log.Printf("Waiting for pod %s to be deleted ... (%ds/%d)", name, i, timeout)
-		time.Sleep(2 * time.Second)
+	hasTeardownContainer := false
+	teardownFinished := false
+	timeout := 5 * time.Minute
+	teardownTimeout := 10 * time.Minute
+
+	pod, err := podClient.Get(name, meta.GetOptions{})
+	switch {
+	case errors.IsNotFound(err), pod.UID != uid:
+		// Pod was removed or mismatching UID
+		return nil
+	case err != nil:
+		return fmt.Errorf("could not retrieve deleting pod: %v", err)
 	}
 
-	return fmt.Errorf("waited for pod %s deletion for %ds, was not deleted", name, timeout)
+	// Attempts to wait for teardown to complete
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name == "teardown" {
+			hasTeardownContainer = true
+			timeout = timeout + teardownTimeout
+			break
+		}
+	}
+
+	watcher, err := podClient.Watch(meta.ListOptions{
+		FieldSelector: fields.Set{"metadata.name": name}.AsSelector().String(),
+		Watch:         true,
+	})
+	if err != nil {
+		return fmt.Errorf("could not create watcher for pod: %v", err)
+	}
+	defer watcher.Stop()
+
+	log.Printf("Waiting for pod %s to be deleted in %d seconds", name, timeout)
+	_, err = watch.Until(timeout, watcher, func(event watch.Event) (done bool, err error) {
+		switch event.Type {
+		case watch.Deleted:
+			// pod was deleted
+			return true, nil
+		case watch.Added, watch.Modified:
+			if hasTeardownContainer && teardownFinished {
+				return false, nil
+			}
+			p, ok := event.Object.(*coreapi.Pod)
+			if !ok {
+				// Unexpected type
+				return false, nil
+			}
+			for _, containerStatus := range p.Status.ContainerStatuses {
+				if containerStatus.Name == "teardown" && containerStatus.State.Terminated != nil {
+					teardownFinished = true
+					return true, nil
+				}
+			}
+		}
+		return false, nil
+	})
+	if err != nil {
+		return fmt.Errorf("waited for pod %s deletion for %ds, was not deleted", name, timeout)
+	}
+	return nil
 }
 
 func waitForCompletedPodDeletion(podClient coreclientset.PodInterface, name string) error {
